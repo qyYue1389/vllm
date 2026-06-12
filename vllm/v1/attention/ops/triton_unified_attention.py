@@ -15,6 +15,7 @@ import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.triton_utils.allocation import set_triton_allocator
 from vllm.v1.attention.ops.triton_attention_helpers import (
     apply_alibi_to_score,
     apply_softcap,
@@ -173,6 +174,44 @@ def _store_output_td(
         [0, 0, 0],
         acc.reshape(BLOCK_Q, num_queries_per_kv, HEAD_SIZE_PADDED),
     )
+
+
+@triton.jit
+def _load_segm_output_td(
+    segm_output_ptr,
+    query_token_idx,
+    query_head_idx,
+    act_num_segments,
+    num_query_heads: tl.constexpr,
+    NUM_SEGMENTS_PER_SEQ: tl.constexpr,
+    HEAD_SIZE: tl.constexpr,
+    HEAD_SIZE_PADDED: tl.constexpr,
+):
+    """Load per-segment attention outputs via a 2D tensor descriptor.
+
+    The segment-output buffer is contiguous with layout
+    ``[num_tokens, num_query_heads, NUM_SEGMENTS_PER_SEQ, HEAD_SIZE_PADDED]``,
+    so the (segment, head_dim) slice of one ``(token, head)`` pair is a
+    dense 2D tile with strides ``(HEAD_SIZE_PADDED, 1)``.  The descriptor
+    ``shape`` is clamped to ``(act_num_segments, HEAD_SIZE)``: rows beyond
+    the actual segment count and lanes beyond ``HEAD_SIZE`` zero-fill on
+    load, matching the ``segm_mask`` / ``dim_mask`` + ``other=0.0``
+    semantics of the pointer path.
+    Returns (NUM_SEGMENTS_PER_SEQ, HEAD_SIZE_PADDED).
+    """
+    segm_base = (
+        segm_output_ptr
+        + query_token_idx.to(tl.int64)
+        * (num_query_heads * NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_PADDED)
+        + query_head_idx * (NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_PADDED)
+    )
+    segm_desc = tl.make_tensor_descriptor(
+        base=segm_base,
+        shape=(act_num_segments, HEAD_SIZE),
+        strides=(HEAD_SIZE_PADDED, 1),
+        block_shape=(NUM_SEGMENTS_PER_SEQ, HEAD_SIZE_PADDED),
+    )
+    return segm_desc.load([0, 0])
 
 
 @triton.jit
@@ -663,6 +702,9 @@ def reduce_segments(
     BLOCK_Q: tl.constexpr,  # int
     NUM_SEGMENTS_PER_SEQ: tl.constexpr,  # int
     USE_FP8: tl.constexpr,  # bool
+    # See ``USE_TD`` on ``kernel_unified_attention``: tensor-descriptor
+    # loads/stores; the disabled branch is dead-code-eliminated.
+    USE_TD: tl.constexpr = False,
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
 ):
@@ -702,18 +744,30 @@ def reduce_segments(
     overall_expsum = tl.sum(segm_expsum)
 
     # load, rescale, and add segment attention outputs
-    segm_output_offset = (
-        query_token_idx.to(tl.int64)
-        * (num_query_heads * NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_PADDED)
-        + query_head_idx * (NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_PADDED)
-        + tl.arange(0, NUM_SEGMENTS_PER_SEQ)[:, None] * HEAD_SIZE_PADDED
-        + tl.arange(0, HEAD_SIZE_PADDED)[None, :]
-    )
-    segm_output = tl.load(
-        segm_output_ptr + segm_output_offset,
-        mask=segm_mask[:, None] & dim_mask[None, :],
-        other=0.0,
-    )
+    if USE_TD:
+        segm_output = _load_segm_output_td(
+            segm_output_ptr,
+            query_token_idx,
+            query_head_idx,
+            act_num_segments,
+            num_query_heads,
+            NUM_SEGMENTS_PER_SEQ,
+            HEAD_SIZE,
+            HEAD_SIZE_PADDED,
+        )
+    else:
+        segm_output_offset = (
+            query_token_idx.to(tl.int64)
+            * (num_query_heads * NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_PADDED)
+            + query_head_idx * (NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_PADDED)
+            + tl.arange(0, NUM_SEGMENTS_PER_SEQ)[:, None] * HEAD_SIZE_PADDED
+            + tl.arange(0, HEAD_SIZE_PADDED)[None, :]
+        )
+        segm_output = tl.load(
+            segm_output_ptr + segm_output_offset,
+            mask=segm_mask[:, None] & dim_mask[None, :],
+            other=0.0,
+        )
     segm_output *= tl.exp(segm_max - overall_max)[:, None]
     acc_sum = tl.sum(segm_output, axis=0)
     # safely divide by overall_expsum, returning 0.0 if overall_expsum is 0
@@ -724,12 +778,37 @@ def reduce_segments(
         acc = tl.clamp(acc, FP8_MIN, FP8_MAX)
 
     # write result
-    output_offset = (
-        query_token_idx * output_stride_0
-        + query_head_idx * output_stride_1
-        + tl.arange(0, HEAD_SIZE_PADDED)
-    )
-    tl.store(output_ptr + output_offset, acc, mask=dim_mask)
+    if USE_TD:
+        # No HEAD_SIZE == HEAD_SIZE_PADDED gate is needed here, unlike
+        # ``_store_output_td``: that helper flattens all heads of a KV
+        # group into one descriptor axis, so padded lanes land *inside*
+        # the descriptor ``shape`` (at the next head's address) and get
+        # written.  Here the descriptor covers a single head and the
+        # padded lanes lie *beyond* ``shape=(1, HEAD_SIZE)``, where
+        # descriptor stores are masked out (verified empirically), which
+        # matches the pointer path's ``dim_mask`` store semantics.
+        out_base = (
+            output_ptr
+            + query_token_idx * output_stride_0
+            + query_head_idx * output_stride_1
+        )
+        out_desc = tl.make_tensor_descriptor(
+            base=out_base,
+            shape=(1, HEAD_SIZE),
+            strides=(output_stride_0, 1),
+            block_shape=(1, HEAD_SIZE_PADDED),
+        )
+        out_desc.store(
+            [0, 0],
+            acc.to(output_ptr.dtype.element_ty).reshape(1, HEAD_SIZE_PADDED),
+        )
+    else:
+        output_offset = (
+            query_token_idx * output_stride_0
+            + query_head_idx * output_stride_1
+            + tl.arange(0, HEAD_SIZE_PADDED)
+        )
+        tl.store(output_ptr + output_offset, acc, mask=dim_mask)
 
 
 def _is_gemma3_attention(head_size: int, sliding_window: int) -> bool:
@@ -805,6 +884,14 @@ def unified_attention(
     assert causal, "Only causal attention is supported"
     if sinks is not None:
         assert sinks.shape[0] == q.shape[1], "Sinks must be num_query_heads size"
+
+    if use_td:
+        # On-device ``tl.make_tensor_descriptor`` needs a runtime scratch
+        # allocator on targets that build TMA tensormaps in global memory
+        # (sm_90+); without one every USE_TD launch fails.  No-op cost on
+        # targets that lower descriptors in software, and use_td defaults
+        # to off on CUDA, so the hot path is unaffected.
+        set_triton_allocator(q.device)
 
     use_per_token_head_scales = kv_quant_mode in (
         KVQuantMode.INT8_PER_TOKEN_HEAD,
@@ -1036,6 +1123,11 @@ def unified_attention(
     )
 
     if use_3d:
+        # The segment-output descriptor's block_shape is
+        # (NUM_SEGMENTS_PER_SEQ, HEAD_SIZE_PADDED); every block_shape
+        # element must be a power of 2 (HEAD_SIZE_PADDED is by
+        # construction, the segment count only by convention).
+        _is_pow2_segm = (num_par_softmax_segments & (num_par_softmax_segments - 1)) == 0
         reduce_segments[(q.shape[0], num_query_heads)](
             output_ptr=out,
             segm_output_ptr=softmax_segm_output,
@@ -1055,4 +1147,5 @@ def unified_attention(
             BLOCK_Q=BLOCK_Q,
             NUM_SEGMENTS_PER_SEQ=num_par_softmax_segments,
             USE_FP8=output_scale is not None,
+            USE_TD=use_td and _is_pow2_segm,
         )

@@ -602,7 +602,9 @@ def test_triton_unified_attn_use_td(
 ) -> None:
     """Exercise the USE_TD (tensor-descriptor) Q/K/V load/store path.
 
-    Covers both 2D and 3D kernels via ``seq_threshold_3D``. Two routes
+    Covers both 2D and 3D kernels via ``seq_threshold_3D``; the 3D
+    launch also exercises the ``reduce_segments`` USE_TD segment-output
+    load and output store. Two routes
     to the USE_TD_QO=False fallback (pointer path for Q/O with TD still
     active for KV tile loads):
 
@@ -647,3 +649,108 @@ def test_triton_unified_attn_use_td_tile_clamp(
         soft_cap=None,
         seq_threshold_3D=0,
     )
+
+
+# ``reduce_segments`` USE_TD coverage with FP8 output: the descriptor
+# store must write the scaled + clamped accumulator cast to the fp8
+# output dtype.  A decode-only batch under ``seq_threshold_3D=8`` forces
+# the 3D kernel + ``reduce_segments`` launch; ``head_size=96`` checks
+# that the store's ``shape=(1, HEAD_SIZE)`` boundary masks the padded
+# tail (HEAD_SIZE_PADDED=128) instead of spilling into the next head.
+@pytest.mark.parametrize("num_heads", [(8, 2), (5, 1)])
+@pytest.mark.parametrize("head_size", [128, 96])
+@torch.inference_mode()
+def test_triton_unified_attn_use_td_fp8_output(
+    num_heads: tuple[int, int],
+    head_size: int,
+) -> None:
+    """FP8-output equivalence for the USE_TD reduce_segments path."""
+    torch.set_default_device(DEVICE_TYPE)
+    set_random_seed(0)
+
+    seq_lens = [(1, 523), (1, 37), (1, 2011)]
+    seq_threshold_3D = 8
+    block_size = 16
+    num_blocks = 2048
+    num_seqs = len(seq_lens)
+    query_lens = [x[0] for x in seq_lens]
+    kv_lens = [x[1] for x in seq_lens]
+    num_query_heads, num_kv_heads = num_heads
+    max_query_len = max(query_lens)
+    max_kv_len = max(kv_lens)
+    scale = head_size**-0.5
+
+    dtype = torch.float16
+    query = torch.randn(sum(query_lens), num_query_heads, head_size, dtype=dtype)
+    key_cache = torch.randn(
+        num_blocks, block_size, num_kv_heads, head_size, dtype=dtype
+    )
+    value_cache = torch.randn_like(key_cache)
+    cu_query_lens = torch.tensor([0] + query_lens, dtype=torch.int32).cumsum(
+        dim=0, dtype=torch.int32
+    )
+    kv_lens_tensor = torch.tensor(kv_lens, dtype=torch.int32)
+
+    max_num_blocks_per_seq = (max_kv_len + block_size - 1) // block_size
+    block_tables = torch.randint(
+        0, num_blocks, (num_seqs, max_num_blocks_per_seq), dtype=torch.int32
+    )
+
+    output = torch.empty(sum(query_lens), num_query_heads, head_size, dtype=FP8_DTYPE)
+    output_scale = torch.tensor(0.5, dtype=torch.float32)
+
+    num_par_softmax_segments = 16
+    head_size_padded = next_power_of_2(head_size)
+    softmax_segm_output = torch.empty(
+        (seq_threshold_3D, num_query_heads, num_par_softmax_segments, head_size_padded),
+        dtype=torch.float32,
+    )
+    softmax_segm_max = torch.empty(
+        (seq_threshold_3D, num_query_heads, num_par_softmax_segments),
+        dtype=torch.float32,
+    )
+    softmax_segm_expsum = torch.empty(
+        (seq_threshold_3D, num_query_heads, num_par_softmax_segments),
+        dtype=torch.float32,
+    )
+
+    unified_attention(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        out=output,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=kv_lens_tensor,
+        max_seqlen_q=max_query_len,
+        max_seqlen_k=max_kv_len,
+        softmax_scale=scale,
+        causal=True,
+        window_size=(-1, -1),
+        block_table=block_tables,
+        softcap=0,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+        output_scale=output_scale,
+        seq_threshold_3D=seq_threshold_3D,
+        num_par_softmax_segments=num_par_softmax_segments,
+        softmax_segm_output=softmax_segm_output,
+        softmax_segm_max=softmax_segm_max,
+        softmax_segm_expsum=softmax_segm_expsum,
+        use_td=True,
+    )
+
+    ref_output = ref_paged_attn(
+        query=query,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        query_lens=query_lens,
+        kv_lens=kv_lens,
+        block_tables=block_tables,
+        scale=scale,
+        sliding_window=None,
+        soft_cap=None,
+    )
+
+    output_fp16 = (output.to(torch.float32) * output_scale.item()).to(torch.float16)
+    torch.testing.assert_close(output_fp16, ref_output, atol=2e-1, rtol=2e-1)
